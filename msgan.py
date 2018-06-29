@@ -31,24 +31,24 @@ class GeneratorNet(torch.nn.Module):
     """
     def __init__(
             self,
-            n_features=100,
+            n_input=100,
             n_out=(28 * 28),
             hidden_sizes=[256, 512, 1024],
             loss=nn.BCELoss()
     ):
         super(GeneratorNet, self).__init__()
-        self.n_features = n_features
+        self.n_input = n_input
         self.n_out = n_out
         self.hidden_sizes = hidden_sizes
         self.loss = loss
 
         self.hidden0 = nn.Sequential(
-            nn.Linear(n_features, hidden_sizes[0]),
-            nn.LeakyReLU(0.2)
+            nn.Linear(n_input, hidden_sizes[0]),
+            nn.LeakyReLU(0.2),
         )
         self.hidden1 = nn.Sequential(
             nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.LeakyReLU(0.2)
+            nn.LeakyReLU(0.2),
         )
         self.hidden2 = nn.Sequential(
             nn.Linear(hidden_sizes[1], hidden_sizes[2]),
@@ -88,19 +88,19 @@ class DiscriminatorNet(torch.nn.Module):
     """
     def __init__(
         self,
-        n_features=(28 * 28),
+        n_input=(28 * 28),
         n_out=1,
         hidden_sizes=[1024, 512, 256],
         loss=nn.BCELoss()
     ):
         super(DiscriminatorNet, self).__init__()
-        self.n_features = n_features
+        self.n_input = n_input
         self.n_out = n_out
         self.hidden_sizes = hidden_sizes
         self.loss = loss
 
         self.hidden0 = nn.Sequential(
-            nn.Linear(n_features, hidden_sizes[0]),
+            nn.Linear(n_input, hidden_sizes[0]),
             nn.LeakyReLU(0.2),
             nn.Dropout(0.3)
         )
@@ -132,7 +132,7 @@ class DiscriminatorNet(torch.nn.Module):
         optimizer.zero_grad()
 
         # 1.1 Train on Real Data
-        real_data = real_data.view(real_data.size(0), self.n_features)
+        real_data = real_data.view(real_data.size(0), self.n_input)
         prediction_real = self(real_data)
         # Calculate error and backpropagate
         error_real = self.loss(prediction_real, real_data_target(real_data.size(0)))
@@ -148,7 +148,7 @@ class DiscriminatorNet(torch.nn.Module):
         optimizer.step()
 
         # Return error
-        return error_real + error_fake, prediction_real, prediction_fake
+        return error_real, error_fake
 
 
 class Generator50(nn.Module):
@@ -205,7 +205,7 @@ class GAN50():
             d_real_data = Variable(real_data_sampler(D.input_size))
             d_real_decision = D(d_real_data)
             d_real_error = self.loss_function(d_real_decision, Variable(torch.ones(1, 1)))  # ones = true
-            d_real_error.backward() # compute/store gradients, but don't change params
+            d_real_error.backward()  # compute/store gradients, but don't change params
 
             #  1B: Train D on fake
             d_gen_input = Variable(fake_data_sampler(minibatch_size, G.input_size))
@@ -213,7 +213,7 @@ class GAN50():
             d_fake_decision = D(d_fake_data.t())
             d_fake_error = self.loss_function(d_fake_decision, Variable(torch.zeros(1, 1)))  # zeros = fake
             d_fake_error.backward()
-            self.d_optimizer.step()     # Only optimizes D's parameters; changes based on stored gradients from backward()
+            self.d_optimizer.step()  # Only optimizes D's parameters; changes based on stored gradients from backward()
 
         for g_index in range(g_steps):
             # 2. Train G on D's response (but DO NOT train D on these labels)
@@ -240,6 +240,11 @@ class MSGAN():
 
 
     def fit(self, data_generator, noise_generator, num_epochs=100):
+
+        loss_on_real_data = []
+        loss_on_fake_data = []
+        generator_loss = []
+
         for n_batch, real_batch in enumerate(data_generator):
 
             # 1. Train Discriminator
@@ -249,10 +254,16 @@ class MSGAN():
             # Generate fake data
             fake_data = self.generator(noise_generator(real_data.size(0))).detach()
             # Train D
-            self.discriminator.fit(self.d_optimizer, real_data, fake_data)
+            loss_real, loss_fake = self.discriminator.fit(self.d_optimizer, real_data, fake_data)
 
             # 2. Train Generator
             # Generate fake data
             fake_data = self.generator(noise_generator(real_batch.size(0)))
             # Train G
-            self.generator.fit(self.g_optimizer, fake_data, self.discriminator)
+            g_loss = self.generator.fit(self.g_optimizer, fake_data, self.discriminator)
+
+            loss_on_real_data.append(loss_real)
+            loss_on_fake_data.append(loss_fake)
+            generator_loss.append(g_loss)
+
+        return loss_on_real_data, loss_on_fake_data, generator_loss
