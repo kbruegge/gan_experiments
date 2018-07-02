@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.autograd import Variable
-import numpy as np
+import torchvision.utils as vutils
+from tensorboardX import SummaryWriter
 
 
 def real_data_target(size):
@@ -79,7 +79,7 @@ class GeneratorNet(torch.nn.Module):
         # Update weights with gradients
         optimizer.step()
         # Return error
-        return error
+        return error, prediction
 
 
 class DiscriminatorNet(torch.nn.Module):
@@ -151,119 +151,174 @@ class DiscriminatorNet(torch.nn.Module):
         return error_real, error_fake
 
 
-class Generator50(nn.Module):
-    def __init__(self, input_size=1, hidden_size=64, output_size=1):
-        super(Generator50, self).__init__()
-        self.input_size = input_size
-        self.output_size = output_size
-        self.map1 = nn.Linear(input_size, hidden_size)
-        self.map2 = nn.Linear(hidden_size, hidden_size)
-        self.map3 = nn.Linear(hidden_size, output_size)
+class GAN():
 
-    def forward(self, x):
-        x = F.elu(self.map1(x))
-        x = F.sigmoid(self.map2(x))
-        return self.map3(x)
-
-
-class Discriminator50(nn.Module):
-    def __init__(self, input_size=1, hidden_size=128, output_size=1):
-        super(Discriminator50, self).__init__()
-        self.input_size = input_size
-        self.output_size = output_size
-        self.map1 = nn.Linear(input_size, hidden_size)
-        self.map2 = nn.Linear(hidden_size, hidden_size)
-        self.map3 = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        x = F.elu(self.map1(x))
-        x = F.elu(self.map2(x))
-        return F.sigmoid(self.map3(x))
-
-
-class GAN50():
-
-    def extract(self, v):
-        return v.data.storage().tolist()
-
-    def __init__(self, generator, discriminator, g_optimizer, d_optimizer, loss_function=nn.BCELoss()):
+    def __init__(self, generator, discriminator, g_optimizer, d_optimizer, comment='GAN'):
         self.generator = generator
         self.discriminator = discriminator
         self.g_optimizer = g_optimizer
         self.d_optimizer = d_optimizer
-        self.loss_function = loss_function
+        self.writer = SummaryWriter(comment=comment)
+        self.comment = comment
 
-    def fit(self, real_data_sampler, fake_data_sampler, d_steps=1, g_steps=1, minibatch_size=100, print_interval=2000):
-        D = self.discriminator
-        G = self.generator
-        for d_index in range(d_steps):
-            # 1. Train D on real+fake
-            D.zero_grad()
+    def _images_to_vectors(self, images):
+        return images.view(images.size(0), 784)
 
-            #  1A: Train D on real
-
-            d_real_data = Variable(real_data_sampler(D.input_size))
-            d_real_decision = D(d_real_data)
-            d_real_error = self.loss_function(d_real_decision, Variable(torch.ones(1, 1)))  # ones = true
-            d_real_error.backward()  # compute/store gradients, but don't change params
-
-            #  1B: Train D on fake
-            d_gen_input = Variable(fake_data_sampler(minibatch_size, G.input_size))
-            d_fake_data = G(d_gen_input).detach()  # detach to avoid training G on these labels
-            d_fake_decision = D(d_fake_data.t())
-            d_fake_error = self.loss_function(d_fake_decision, Variable(torch.zeros(1, 1)))  # zeros = fake
-            d_fake_error.backward()
-            self.d_optimizer.step()  # Only optimizes D's parameters; changes based on stored gradients from backward()
-
-        for g_index in range(g_steps):
-            # 2. Train G on D's response (but DO NOT train D on these labels)
-            G.zero_grad()
-
-            gen_input = Variable(fake_data_sampler(minibatch_size, G.input_size))
-            g_fake_data = G(gen_input)
-            dg_fake_decision = D(g_fake_data.t())
-            g_error = self.loss_function(dg_fake_decision, Variable(torch.ones(1, 1)))  # we want to fool, so pretend it's all genuine
-
-            g_error.backward()
-            self.g_optimizer.step()  # Only optimizes G's parameters
-
-        return float(d_real_error), float(d_fake_error), float(g_error), np.array(d_real_data), np.array(d_fake_data.data)
-
-
-class MSGAN():
-
-    def __init__(self, generator, discriminator, g_optimizer, d_optimizer):
-        self.generator = generator
-        self.discriminator = discriminator
-        self.g_optimizer = g_optimizer
-        self.d_optimizer = d_optimizer
-
+    def _vectors_to_images(self, vectors):
+        return vectors.view(vectors.size(0), 1, 28, 28)
 
     def fit(self, data_generator, noise_generator, num_epochs=100):
+        step = 0
+        for epoch in range(num_epochs):
+            for n_batch, (real_batch, _) in enumerate(data_generator):
 
-        loss_on_real_data = []
-        loss_on_fake_data = []
-        generator_loss = []
+                # 1. Train Discriminator
+                real_data = Variable(real_batch)
+                if torch.cuda.is_available():
+                    real_data = real_data.cuda()
+                # Generate fake data
+                fake_data = self.generator(noise_generator(real_data.size(0))).detach()
+                # Train D
+                loss_real, loss_fake = self.discriminator.fit(self.d_optimizer, real_data, fake_data)
 
-        for n_batch, real_batch in enumerate(data_generator):
+                # 2. Train Generator
+                # Generate fake data
+                fake_data = self.generator(noise_generator(real_batch.size(0)))
+                # Train G
+                g_loss, _ = self.generator.fit(self.g_optimizer, fake_data, self.discriminator)
+                step += 1
+                self.log_scalars(loss_real, loss_fake, g_loss, step)
 
-            # 1. Train Discriminator
-            real_data = Variable(real_batch)
-            if torch.cuda.is_available():
-                real_data = real_data.cuda()
-            # Generate fake data
-            fake_data = self.generator(noise_generator(real_data.size(0))).detach()
-            # Train D
-            loss_real, loss_fake = self.discriminator.fit(self.d_optimizer, real_data, fake_data)
+            test_noise = noise_generator(16)
+            images = self.generator(test_noise)
+            self.log_images(images, step)
 
-            # 2. Train Generator
-            # Generate fake data
-            fake_data = self.generator(noise_generator(real_batch.size(0)))
-            # Train G
-            g_loss = self.generator.fit(self.g_optimizer, fake_data, self.discriminator)
+            print(f'Epoch: [{epoch}/{num_epochs}]')
+            print(f'Generator Loss: {g_loss:.4f}')
+            print(f'D(x): {loss_real.mean():.4f}, D(G(z)): { loss_fake.mean():.4f}')
 
-            loss_on_real_data.append(loss_real)
-            loss_on_fake_data.append(loss_fake)
-            generator_loss.append(g_loss)
 
-        return loss_on_real_data, loss_on_fake_data, generator_loss
+    def log_scalars(self, loss_real, loss_fake, g_loss, step):
+        self.writer.add_scalar(f'{self.comment}/D_error', loss_real + loss_fake, step)
+        self.writer.add_scalar(f'{self.comment}/G_error', g_loss, step)
+        self.writer.add_scalar(f'{self.comment}/D(x)', loss_real.mean(), step)
+        self.writer.add_scalar(f'{self.comment}/D(g(y))', loss_fake.mean(), step)
+
+    def log_images(self, images, step):
+        images = self._vectors_to_images(images).data.cpu()
+        # images = torch.from_numpy(test_images)
+        img_name = '{}/images{}'.format(self.comment, '')
+
+        # Make horizontal grid from image tensor
+        horizontal_grid = vutils.make_grid(images, scale_each=True)
+        # Add horizontal images to tensorboard
+        self.writer.add_image(img_name, horizontal_grid, step)
+
+#
+# class GAN_ORIGINAL():
+#
+#     def __init__(self, discriminator, generator, d_optimizer, g_optimizer, name='GAN ORIGINAL'):
+#         self.discriminator = discriminator
+#         self.generator = generator
+#         self.d_optimizer = d_optimizer
+#         self.g_optimizer = g_optimizer
+#         if torch.cuda.is_available():
+#             self.discriminator = discriminator.cuda()
+#             self.generator = generator.cuda()
+#
+#         self.logger = Logger(model_name=name, data_name='MNIST')
+#
+#     def _real_data_target(self, size):
+#         '''
+#         Tensor containing ones, with shape = size
+#         '''
+#         data = Variable(torch.ones(size, 1))
+#         if torch.cuda.is_available():
+#             return data.cuda()
+#         return data
+#
+#     def _fake_data_target(self, size):
+#         '''
+#         Tensor containing zeros, with shape = size
+#         '''
+#         data = Variable(torch.zeros(size, 1))
+#         if torch.cuda.is_available():
+#             return data.cuda()
+#         return data
+#
+#
+#     def _images_to_vectors(self, images):
+#         return images.view(images.size(0), 784)
+#
+#     def _vectors_to_images(self, vectors):
+#         return vectors.view(vectors.size(0), 1, 28, 28)
+#
+#
+#     def _train_discriminator(self, optimizer, real_data, fake_data, loss):
+#         # Reset gradients
+#         optimizer.zero_grad()
+#
+#         # 1.1 Train on Real Data
+#         prediction_real = self.discriminator(real_data)
+#         # Calculate error and backpropagate
+#         error_real = loss(prediction_real, self._real_data_target(real_data.size(0)))
+#         error_real.backward()
+#
+#         # 1.2 Train on Fake Data
+#         prediction_fake = self.discriminator(fake_data)
+#         # Calculate error and backpropagate
+#         error_fake = loss(prediction_fake, self._fake_data_target(real_data.size(0)))
+#         error_fake.backward()
+#
+#         # 1.3 Update weights with gradients
+#         optimizer.step()
+#
+#         # Return error
+#         return error_real + error_fake, prediction_real, prediction_fake
+#
+#     def _train_generator(self, optimizer, fake_data, loss):
+#         # 2. Train Generator
+#         # Reset gradients
+#         optimizer.zero_grad()
+#         # Sample noise and generate fake data
+#         prediction = self.discriminator(fake_data)
+#         # Calculate error and backpropagate
+#         error = loss(prediction, self._real_data_target(prediction.size(0)))
+#         error.backward()
+#         # Update weights with gradients
+#         optimizer.step()
+#         # Return error
+#         return error
+#
+#     def fit(self, data_loader, input_noise, loss=nn.BCELoss(), num_epochs=100):
+#         num_batches = len(data_loader)
+#         for epoch in range(num_epochs):
+#             for n_batch, (real_batch, _) in enumerate(data_loader):
+#
+#                 # 1. Train Discriminator
+#                 real_data = Variable(self._images_to_vectors(real_batch))
+#
+#                 if torch.cuda.is_available():
+#                     real_data = real_data.cuda()
+#
+#                 # Generate fake data
+#                 fake_data = self.generator(input_noise(real_data.size(0))).detach()
+#                 # Train D
+#                 d_error, d_pred_real, d_pred_fake = self._train_discriminator(self.d_optimizer, real_data, fake_data, loss)
+#
+#                 # 2. Train Generator
+#                 # Generate fake data
+#                 fake_data = self.generator(input_noise(real_batch.size(0)))
+#                 # Train G
+#                 g_error = self._train_generator(self.g_optimizer, fake_data, loss)
+#                 # Log error
+#                 self.logger.log(d_error, g_error, d_pred_real, d_pred_fake, epoch, n_batch, num_batches)
+#
+#             # Display Progress
+# #             display.clear_output(True)
+#             num_test_samples = 16
+#             test_noise = input_noise(num_test_samples)
+#             test_images = self._vectors_to_images(self.generator(test_noise)).data.cpu()
+#             self.logger.log_images(test_images, num_test_samples, epoch, n_batch, num_batches)
+#             self.logger.display_status(epoch, num_epochs, d_error, g_error, d_pred_real, d_pred_fake)
+#             self.logger.save_models(self.generator, self.discriminator, epoch)
